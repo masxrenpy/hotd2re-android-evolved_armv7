@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # SHA-256 fingerprint of the fixed signing key. The build stops if the key in the secret is not this one.
+  EXPECTED_FINGERPRINT: "31:98:DA:53:81:4C:DE:BC:41:E2:42:47:AD:7A:8E:75:4B:41:71:13:C3:4A:AB:93:59:6D:35:C6:AF:2C:07:2C"
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -20,6 +24,26 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+
+      - name: Prepare the fixed signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.HOTD2_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::Falta el secreto HOTD2_KEYSTORE_B64. Crealo en Settings > Secrets and variables > Actions > New repository secret."
+            exit 1
+          fi
+          mkdir -p "$HOME/.android"
+          if ! printf '%s' "$KEYSTORE_B64" | tr -d ' \n\r' | base64 -d > "$HOME/.android/debug.keystore" 2>/dev/null; then
+            echo "::error::El secreto HOTD2_KEYSTORE_B64 no es base64 valido. Copialo completo, sin cortar el final."
+            exit 1
+          fi
+          FOUND=$(keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey 2>/dev/null | grep -i 'fingerprint' | head -1 | sed 's/.*: //')
+          echo "Key fingerprint found: $FOUND"
+          if [ "$FOUND" != "$EXPECTED_FINGERPRINT" ]; then
+            echo "::error::La clave del secreto no es la esperada. Revisa que copiaste el texto completo."
+            exit 1
+          fi
 
       - name: Install Android SDK components
         run: |
@@ -79,7 +103,7 @@ jobs:
                "    private static List<String> readLines(Path file) {\n")
           edit(diag,
                'appendRecent(report, "Engine", engine, 8);',
-               'appendRecent(report, "Engine", engine, 14);')
+               'appendRecent(report, "Engine", engine, 24);')
 
           # 2. Engine: if SDL rejects the GPU, retry without the optional Vulkan features.
           gpu = "src/port/render/sdl_gpu_device.cpp"
@@ -158,6 +182,218 @@ jobs:
                "    }\n"
                "\n"
                "    if ((!deviceFeatures.independentBlend")
+          # 4. Frame-time meter: prints two "gpu: perf" lines every 15 s, which the launcher copies into the report.
+          HEADER = r'''// Frame-time meter added for the 32-bit test build. It prints "gpu: perf" lines to stderr and the launcher
+          // copies them into the diagnostics report. Everything runs on the game thread.
+          #pragma once
+
+          #include <algorithm>
+          #include <atomic>
+          #include <chrono>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+
+          namespace hotd2perf {
+
+          inline std::atomic<uint32_t> pipelineCreates{0};
+          inline std::atomic<uint64_t> pipelineMicros{0};
+          inline std::atomic<uint32_t> textureCreates{0};
+          inline std::atomic<uint64_t> textureMicros{0};
+
+          // Adds one event and its duration to a pair of counters when it goes out of scope.
+          class Scope {
+          public:
+              Scope(std::atomic<uint32_t>& count, std::atomic<uint64_t>& micros)
+                  : count_(count), micros_(micros), start_(std::chrono::steady_clock::now()) {}
+              ~Scope() {
+                  const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start_).count();
+                  count_.fetch_add(1, std::memory_order_relaxed);
+                  micros_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+              }
+              Scope(const Scope&) = delete;
+              Scope& operator=(const Scope&) = delete;
+
+          private:
+              std::atomic<uint32_t>& count_;
+              std::atomic<uint64_t>& micros_;
+              std::chrono::steady_clock::time_point start_;
+          };
+
+          inline long ReadKilobytes(const char* path, const char* key) {
+              FILE* file = std::fopen(path, "r");
+              if (!file) return -1;
+              char line[256];
+              const size_t keyLength = std::strlen(key);
+              long value = -1;
+              while (std::fgets(line, sizeof(line), file)) {
+                  if (std::strncmp(line, key, keyLength) == 0) {
+                      value = std::strtol(line + keyLength, nullptr, 10);
+                      break;
+                  }
+              }
+              std::fclose(file);
+              return value;
+          }
+
+          // Frame times in 0.5 ms buckets up to 250 ms.
+          class Histogram {
+          public:
+              void Add(double ms) {
+                  int index = static_cast<int>(ms * 2.0);
+                  index = std::max(0, std::min(index, kBuckets - 1));
+                  ++bucket_[index];
+                  ++count_;
+                  sum_ += ms;
+                  max_ = std::max(max_, ms);
+              }
+              double Percentile(double fraction) const {
+                  if (!count_) return 0;
+                  const uint32_t target = std::max<uint32_t>(1, static_cast<uint32_t>(std::ceil(fraction * count_)));
+                  uint32_t seen = 0;
+                  for (int i = 0; i < kBuckets; ++i) {
+                      seen += bucket_[i];
+                      if (seen >= target) return i == kBuckets - 1 ? max_ : (i + 1) * 0.5;
+                  }
+                  return max_;
+              }
+              double Max() const { return max_; }
+              uint32_t Count() const { return count_; }
+              void Clear() { *this = Histogram(); }
+
+          private:
+              static constexpr int kBuckets = 501;
+              uint32_t bucket_[kBuckets] = {};
+              uint32_t count_ = 0;
+              double sum_ = 0;
+              double max_ = 0;
+          };
+
+          class FrameMeter {
+          public:
+              void Frame(double totalMs, double gameMs, double acquireMs, double drawMs, double submitMs, int steps) {
+                  if (totalMs <= 0 || totalMs > 5000) return;  // skip the gap after the app was in the background
+                  hist_.Add(totalMs);
+                  windowMs_ += totalMs;
+                  game_ += gameMs;
+                  acquire_ += acquireMs;
+                  draw_ += drawMs;
+                  submit_ += submitMs;
+                  simSteps_ += steps;
+                  if (steps > 1) ++multiStep_;
+                  maxSteps_ = std::max(maxSteps_, steps);
+                  if (totalMs > 33.4) ++slow33_;
+                  if (totalMs > 50.0) ++slow50_;
+                  if (totalMs > 100.0) ++slow100_;
+                  if (totalMs >= worstTotal_) {
+                      worstTotal_ = totalMs;
+                      worstGame_ = gameMs;
+                      worstAcquire_ = acquireMs;
+                      worstDraw_ = drawMs;
+                      worstSubmit_ = submitMs;
+                      worstSteps_ = steps;
+                  }
+                  if (windowMs_ >= kWindowMs) Flush();
+              }
+
+          private:
+              static constexpr double kWindowMs = 15000.0;
+
+              void Flush() {
+                  const double frames = hist_.Count();
+                  const double seconds = windowMs_ / 1000.0;
+                  std::fprintf(stderr, "gpu: perf t=%.0fs fps=%.1f sim=%.1f p50=%.1f p95=%.1f p99=%.1f max=%.1f ms slow33=%u slow50=%u slow100=%u\n",
+                               seconds, frames / seconds, simSteps_ / seconds, hist_.Percentile(0.50), hist_.Percentile(0.95),
+                               hist_.Percentile(0.99), hist_.Max(), slow33_, slow50_, slow100_);
+                  const uint32_t pipes = pipelineCreates.exchange(0, std::memory_order_relaxed);
+                  const double pipeMs = pipelineMicros.exchange(0, std::memory_order_relaxed) / 1000.0;
+                  const uint32_t textures = textureCreates.exchange(0, std::memory_order_relaxed);
+                  const double textureMs = textureMicros.exchange(0, std::memory_order_relaxed) / 1000.0;
+                  const long rss = ReadKilobytes("/proc/self/status", "VmRSS:");
+                  const long avail = ReadKilobytes("/proc/meminfo", "MemAvailable:");
+                  std::fprintf(stderr,
+                               "gpu: perf2 avg game=%.1f acquire=%.1f draw=%.1f submit=%.1f ms, worst frame game=%.1f acquire=%.1f draw=%.1f "
+                               "submit=%.1f ms steps=%d, multistep=%u maxsteps=%d, pipes=%u/%.1f ms tex=%u/%.1f ms, rss=%ld avail=%ld MB\n",
+                               game_ / frames, acquire_ / frames, draw_ / frames, submit_ / frames, worstGame_, worstAcquire_, worstDraw_,
+                               worstSubmit_, worstSteps_, multiStep_, maxSteps_, pipes, pipeMs, textures, textureMs, rss < 0 ? -1 : rss / 1024,
+                               avail < 0 ? -1 : avail / 1024);
+                  hist_.Clear();
+                  windowMs_ = game_ = acquire_ = draw_ = submit_ = 0;
+                  worstTotal_ = worstGame_ = worstAcquire_ = worstDraw_ = worstSubmit_ = 0;
+                  simSteps_ = 0;
+                  multiStep_ = slow33_ = slow50_ = slow100_ = 0;
+                  maxSteps_ = worstSteps_ = 0;
+              }
+
+              Histogram hist_;
+              double windowMs_ = 0, game_ = 0, acquire_ = 0, draw_ = 0, submit_ = 0;
+              double worstTotal_ = 0, worstGame_ = 0, worstAcquire_ = 0, worstDraw_ = 0, worstSubmit_ = 0;
+              uint64_t simSteps_ = 0;
+              uint32_t multiStep_ = 0, slow33_ = 0, slow50_ = 0, slow100_ = 0;
+              int maxSteps_ = 0, worstSteps_ = 0;
+          };
+
+          inline FrameMeter& Meter() {
+              static FrameMeter meter;
+              return meter;
+          }
+
+          }  // namespace hotd2perf
+          '''
+          header_path = root / "src/port/render/perf_counters.h"
+          header_path.write_text(HEADER, encoding="utf-8")
+          print("wrote src/port/render/perf_counters.h")
+
+          play = "src/port/tools/play.cpp"
+          edit(play,
+               '#include "port/play/update_prompt.h"\n',
+               '#include "port/play/update_prompt.h"\n#include "port/render/perf_counters.h"\n')
+          edit(play,
+               "    for (;;) {\n        int steps = 1;\n        bool netStalled = false;\n",
+               "    for (;;) {\n        const double hotdLoopStart = plat.Seconds();\n        int steps = 1;\n        bool netStalled = false;\n")
+          edit(play,
+               "const bool beganFrame = gpu->BeginFrame(clear);",
+               "const double hotdBeforeBegin = plat.Seconds();\n"
+               "        const bool beganFrame = gpu->BeginFrame(clear);\n"
+               "        const double hotdAfterBegin = plat.Seconds();")
+          edit(play,
+               "if (!finishFrame()) return 1;  // only presentation can wait; gameplay uses the fixed 60 Hz clock",
+               "const double hotdBeforeSubmit = plat.Seconds();\n"
+               "        if (!finishFrame()) return 1;  // only presentation can wait; gameplay uses the fixed 60 Hz clock\n"
+               "        const double hotdAfterSubmit = plat.Seconds();")
+          edit(play,
+               "if (lastDeliveredSeconds > 0) frameStatistics.Observe((delivered - lastDeliveredSeconds) * 1000);",
+               "if (lastDeliveredSeconds > 0) frameStatistics.Observe((delivered - lastDeliveredSeconds) * 1000);\n"
+               "            if (lastDeliveredSeconds > 0)\n"
+               "                hotd2perf::Meter().Frame((delivered - lastDeliveredSeconds) * 1000, (hotdBeforeBegin - hotdLoopStart) * 1000,\n"
+               "                                         (hotdAfterBegin - hotdBeforeBegin) * 1000, (hotdBeforeSubmit - hotdAfterBegin) * 1000,\n"
+               "                                         (hotdAfterSubmit - hotdBeforeSubmit) * 1000, steps);")
+
+          edit(gpu,
+               '#include "hotd2_vulkan_shaders.h"\n#endif\n',
+               '#include "hotd2_vulkan_shaders.h"\n#endif\n#include "perf_counters.h"\n')
+          edit(gpu,
+               "    SDL_GPUGraphicsPipeline* p = SDL_CreateGPUGraphicsPipeline(dev_, &pi);\n",
+               "    SDL_GPUGraphicsPipeline* p = nullptr;\n"
+               "    {\n"
+               "        hotd2perf::Scope timing(hotd2perf::pipelineCreates, hotd2perf::pipelineMicros);\n"
+               "        p = SDL_CreateGPUGraphicsPipeline(dev_, &pi);\n"
+               "    }\n")
+          edit(gpu,
+               "GpuTexture SdlGpuDevice::CreateTexture(const RgbaImage& img, bool alphaWeighted) {\n",
+               "GpuTexture SdlGpuDevice::CreateTexture(const RgbaImage& img, bool alphaWeighted) {\n"
+               "    hotd2perf::Scope timing(hotd2perf::textureCreates, hotd2perf::textureMicros);\n")
+
+          # 5. Every build gets a higher versionCode, so Android always accepts it as an update.
+          edit("android/game/build.gradle",
+               "def abi = providers.gradleProperty('hotd2Abi').getOrElse('arm64-v8a')\n",
+               "def abi = providers.gradleProperty('hotd2Abi').getOrElse('arm64-v8a')\n"
+               "def versionNumber = (project.findProperty('hotd2VersionCode') ?: '3').toInteger()\n")
+          edit("android/game/build.gradle",
+               "        versionCode 3\n",
+               "        versionCode versionNumber\n")
           print("done")
           PY
           python3 -I "$RUNNER_TEMP/apply_changes.py" "$GITHUB_WORKSPACE"
@@ -166,8 +402,19 @@ jobs:
         run: |
           chmod +x android/gradlew
           android/gradlew -p android --no-daemon --console=plain :game:assembleDebug \
-            -Photd2Abi=armeabi-v7a -Photd2ApplicationId=com.codepdbh.hotd2evolved.armv7test
+            -Photd2Abi=armeabi-v7a -Photd2ApplicationId=com.codepdbh.hotd2evolved.armv7test \
+            -Photd2VersionCode=$((100 + GITHUB_RUN_NUMBER))
           cp android/game/build/outputs/apk/debug/game-debug.apk hotd2re-armv7-test.apk
+
+      - name: Check that the APK carries the fixed signature
+        run: |
+          EXPECTED_HEX=$(echo "$EXPECTED_FINGERPRINT" | tr -d ':' | tr 'A-F' 'a-f')
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs hotd2re-armv7-test.apk | tee "$RUNNER_TEMP/certs.txt"
+          if ! grep -qi "certificate SHA-256 digest: $EXPECTED_HEX" "$RUNNER_TEMP/certs.txt"; then
+            echo "::error::El APK no quedo firmado con la clave fija. No se publica."
+            exit 1
+          fi
+          echo "Signature OK: the update will install over the previous test build."
 
       - name: Keep the APK as a run artifact
         uses: actions/upload-artifact@v4
@@ -183,4 +430,4 @@ jobs:
           gh release create "armv7-test-${{ github.run_number }}" hotd2re-armv7-test.apk \
             --prerelease --target "${{ github.sha }}" \
             --title "armv7 test build ${{ github.run_number }}" \
-            --notes "Experimental 32-bit test build. Installs next to the normal app (different package name)."
+            --notes "Experimental 32-bit test build with the frame-time meter. Signed with the fixed test key, so it installs over the previous one."
