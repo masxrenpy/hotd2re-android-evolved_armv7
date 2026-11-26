@@ -394,6 +394,26 @@ jobs:
           edit("android/game/build.gradle",
                "        versionCode 3\n",
                "        versionCode versionNumber\n")
+
+          # 6. Sign with the fixed key explicitly (-Photd2Keystore=<file>) instead of relying on the default debug keystore location.
+          edit("android/game/build.gradle",
+               "def versionNumber = (project.findProperty('hotd2VersionCode') ?: '3').toInteger()\n",
+               "def versionNumber = (project.findProperty('hotd2VersionCode') ?: '3').toInteger()\n"
+               "def fixedKeystore = project.findProperty('hotd2Keystore')\n")
+          edit("android/game/build.gradle",
+               "    buildTypes {\n        debug {\n",
+               "    signingConfigs {\n"
+               "        if (fixedKeystore) {\n"
+               "            hotd2fixed {\n"
+               "                storeFile file(fixedKeystore)\n"
+               "                storePassword 'android'\n"
+               "                keyAlias 'androiddebugkey'\n"
+               "                keyPassword 'android'\n"
+               "            }\n"
+               "        }\n"
+               "    }\n\n"
+               "    buildTypes {\n        debug {\n"
+               "            if (fixedKeystore) signingConfig signingConfigs.hotd2fixed\n")
           print("done")
           PY
           python3 -I "$RUNNER_TEMP/apply_changes.py" "$GITHUB_WORKSPACE"
@@ -403,7 +423,8 @@ jobs:
           chmod +x android/gradlew
           android/gradlew -p android --no-daemon --console=plain :game:assembleDebug \
             -Photd2Abi=armeabi-v7a -Photd2ApplicationId=com.codepdbh.hotd2evolved.armv7test \
-            -Photd2VersionCode=$((100 + GITHUB_RUN_NUMBER))
+            -Photd2VersionCode=$((100 + GITHUB_RUN_NUMBER)) \
+            -Photd2Keystore="$HOME/.android/debug.keystore"
           cp android/game/build/outputs/apk/debug/game-debug.apk hotd2re-armv7-test.apk
 
       - name: Check that the APK carries the fixed signature
