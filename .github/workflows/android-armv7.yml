@@ -563,10 +563,20 @@ jobs:
       - name: Build the 32-bit APK
         run: |
           chmod +x android/gradlew
-          android/gradlew -p android --no-daemon --console=plain :game:assembleDebug \
-            -Photd2Abi=armeabi-v7a -Photd2ApplicationId=com.codepdbh.hotd2evolved.armv7test \
-            -Photd2VersionCode=$((100 + GITHUB_RUN_NUMBER)) \
-            -Photd2Keystore="$HOME/.android/debug.keystore"
+          # Maven Central sometimes answers 429 (too many requests) to shared runners: wait and retry.
+          ok=0
+          for attempt in 1 2 3 4; do
+            if android/gradlew -p android --no-daemon --console=plain :game:assembleDebug \
+              -Photd2Abi=armeabi-v7a -Photd2ApplicationId=com.codepdbh.hotd2evolved.armv7test \
+              -Photd2VersionCode=$((100 + GITHUB_RUN_NUMBER)) \
+              -Photd2Keystore="$HOME/.android/debug.keystore"; then
+              ok=1
+              break
+            fi
+            echo "::warning::Build attempt $attempt failed; waiting before retrying."
+            sleep $((attempt * 90))
+          done
+          [ "$ok" = 1 ] || exit 1
           cp android/game/build/outputs/apk/debug/game-debug.apk hotd2re-armv7-test.apk
 
       - name: Check that the APK carries the fixed signature
